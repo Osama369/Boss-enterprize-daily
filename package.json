@@ -4,9 +4,9 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
+    "start": "node src/index.js",
     "dev": "nodemon --env-file=.env src/index.js",
-    "seed:admin": "node scripts/seedAdmin.js",
-    "start": "node src/index.js"
+    "seed:admin": "node scripts/seedAdmin.js"
   },
   "author": "",
   "license": "ISC",
