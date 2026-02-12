@@ -344,6 +344,11 @@ const transferBalanceBetweenUsers = async (req, res) => {
   try {
     // Only distributors (and admins) can transfer in this flow
     const senderRole = req.user.role;
+    const ownerAdminId = String(process.env.OWNER_ADMIN_ID || '').trim();
+    const isUnlimitedOwnerAdmin =
+      senderRole === 'admin' &&
+      ownerAdminId &&
+      String(req.user.id) === ownerAdminId;
     if (senderRole !== 'distributor' && senderRole !== 'admin') {
       return res.status(403).json({ error: 'Only distributors or admins can perform transfers' });
     }
@@ -366,8 +371,15 @@ const transferBalanceBetweenUsers = async (req, res) => {
     }
 
     if (senderRole === 'admin') {
-      if (target.role !== 'distributor' || !target.createdBy || String(target.createdBy) !== String(req.user.id)) {
-        return res.status(403).json({ error: 'Admin can only transfer to distributors they created' });
+      // Owner admin can transfer to any distributor without sender balance deduction.
+      if (isUnlimitedOwnerAdmin) {
+        if (target.role !== 'distributor') {
+          return res.status(403).json({ error: 'Owner admin can only transfer to distributor accounts' });
+        }
+      } else {
+        if (target.role !== 'distributor' || !target.createdBy || String(target.createdBy) !== String(req.user.id)) {
+          return res.status(403).json({ error: 'Admin can only transfer to distributors they created' });
+        }
       }
     }
 
@@ -401,7 +413,14 @@ const transferBalanceBetweenUsers = async (req, res) => {
     // Create transfer record for audit/reconciliation if not present
     if (!tx) {
       try {
-        tx = await Transfer.create({ from: req.user.id, to: targetUserId, amount: amt, status: 'pending', idempotencyKey });
+        tx = await Transfer.create({
+          from: req.user.id,
+          to: targetUserId,
+          amount: amt,
+          status: 'pending',
+          idempotencyKey,
+          meta: { unlimitedByOwnerAdmin: !!isUnlimitedOwnerAdmin },
+        });
       } catch (createErr) {
         // Duplicate-key race: another request may have created the same idempotency record concurrently
         if (createErr && createErr.code === 11000 && idempotencyKey) {
@@ -430,32 +449,50 @@ const transferBalanceBetweenUsers = async (req, res) => {
     }
 
     try {
-      // Atomically decrement sender
-      const sender = await User.findOneAndUpdate(
-        { _id: req.user.id, balance: { $gte: amt } },
-        { $inc: { balance: -amt } },
-        { new: true }
-      );
-      if (!sender) {
-        await Transfer.findByIdAndUpdate(tx._id, { status: 'failed', attempts: (tx.attempts||0) + 1 });
-        return res.status(400).json({ error: 'Insufficient balance' });
+      const shouldDeductSender = !isUnlimitedOwnerAdmin;
+      let sender = null;
+
+      if (shouldDeductSender) {
+        // Regular distributor/admin flow: atomically decrement sender first.
+        sender = await User.findOneAndUpdate(
+          { _id: req.user.id, balance: { $gte: amt } },
+          { $inc: { balance: -amt } },
+          { new: true }
+        );
+        if (!sender) {
+          await Transfer.findByIdAndUpdate(tx._id, { status: 'failed', attempts: (tx.attempts||0) + 1 });
+          return res.status(400).json({ error: 'Insufficient balance' });
+        }
+      } else {
+        // Owner admin unlimited flow: keep sender balance unchanged.
+        sender = await User.findById(req.user.id).select('balance');
       }
 
       // Credit target
       const updatedTarget = await User.findByIdAndUpdate(targetUserId, { $inc: { balance: amt } }, { new: true });
       if (!updatedTarget) {
-        // Attempt refund
-        try {
-          await User.findByIdAndUpdate(req.user.id, { $inc: { balance: amt } });
-        } catch (refundErr) {
-          console.error('Failed to refund after partial transfer failure:', refundErr);
+        // Attempt refund only when sender was actually deducted.
+        if (shouldDeductSender) {
+          try {
+            await User.findByIdAndUpdate(req.user.id, { $inc: { balance: amt } });
+          } catch (refundErr) {
+            console.error('Failed to refund after partial transfer failure:', refundErr);
+          }
         }
         await Transfer.findByIdAndUpdate(tx._id, { status: 'failed', attempts: (tx.attempts||0) + 1 });
         return res.status(500).json({ error: 'Failed to credit target user' });
       }
 
-      await Transfer.findByIdAndUpdate(tx._id, { status: 'done', completedAt: new Date() });
-      return res.status(200).json({ message: 'Transfer successful', senderBalance: sender.balance, targetBalance: updatedTarget.balance });
+      await Transfer.findByIdAndUpdate(tx._id, {
+        status: 'done',
+        completedAt: new Date(),
+        meta: { ...(tx.meta || {}), unlimitedByOwnerAdmin: !!isUnlimitedOwnerAdmin },
+      });
+      return res.status(200).json({
+        message: 'Transfer successful',
+        senderBalance: sender?.balance,
+        targetBalance: updatedTarget.balance,
+      });
     } catch (err) {
       await Transfer.findByIdAndUpdate(tx._id, { status: 'failed', attempts: (tx.attempts||0) + 1 });
       return res.status(500).json({ error: err.message });
@@ -524,3 +561,4 @@ export {
   getDistributorParties,
   transferBalanceBetweenUsers,
 };
+
