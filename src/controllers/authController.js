@@ -85,11 +85,10 @@ const adminLogin = async (req, res) => {
 
 const logout = async (req, res) => {
   try {
-    res.clearCookie(authCookieName, {
-      ...getCookieOptions(0),
-      maxAge: undefined,
-      expires: new Date(0),
-    });
+    const clearOptions = getCookieOptions(1);
+    delete clearOptions.maxAge;
+    // Express clearCookie already expires immediately; keep only matching cookie attributes.
+    res.clearCookie(authCookieName, clearOptions);
     return res.status(200).json({
       success: true,
       message: 'Logged out successfully',

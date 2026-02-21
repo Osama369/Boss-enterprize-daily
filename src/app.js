@@ -5,12 +5,29 @@ import { errorHandler } from "./middlewares/errorHandler.middleware.js";
 
 const app = express();
 
-app.use(
-  cors({
-    origin: process.env.CORS_ORIGIN,
-    credentials: true,
-  })
-);
+const normalizeOrigin = (value) => String(value || "").trim().replace(/\/+$/, "");
+const allowedOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map(normalizeOrigin)
+  .filter(Boolean);
+
+const corsOptions = {
+  origin(origin, callback) {
+    // Allow non-browser requests (no Origin header), e.g. health checks/postman/server-to-server.
+    if (!origin) return callback(null, true);
+    const requestOrigin = normalizeOrigin(origin);
+    if (allowedOrigins.includes("*") || allowedOrigins.includes(requestOrigin)) {
+      return callback(null, true);
+    }
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key"],
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 app.use(
   express.json({
