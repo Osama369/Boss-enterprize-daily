@@ -14,6 +14,10 @@ function buildDateSlotFilter({ date, timeSlot, timeSlotId }) {
     return filter;
 }
 
+function escapeRegex(input = '') {
+    return String(input).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 const addDataForTimeSlot = async (req, res) => {
     const { data, userId: targetUserIdBody, date, timeSlot, timeSlotId } = req.body;
     if (!Array.isArray(data) || data.length === 0) return res.status(400).json({ error: 'data array is required' });
@@ -325,6 +329,65 @@ const getCombinedVoucherData = async (req, res) => {
     }
 };
 
+const searchDataByNumber = async (req, res) => {
+    const { date, timeSlot, timeSlotId, q, userId } = req.query;
+    if (!date || !q) return res.status(400).json({ error: 'date and q are required' });
+
+    try {
+        const filter = buildDateSlotFilter({ date, timeSlot, timeSlotId });
+        const role = req.user?.role;
+        const requesterId = String(req.user?.id || '');
+
+        if (role === 'user') {
+            filter.userId = requesterId;
+        } else if (role === 'distributor') {
+            const clientUsers = await User.find({
+                createdBy: requesterId,
+                role: { $in: ['user', 'party'] },
+            }).select('_id');
+            const clientIds = clientUsers.map((u) => u._id);
+            if (clientIds.length === 0) {
+                return res.status(200).json({ data: [] });
+            }
+            filter.userId = { $in: clientIds };
+        } else if (role === 'admin') {
+            if (userId) filter.userId = userId;
+        }
+
+        const needle = String(q || '').trim();
+        if (!needle) return res.status(200).json({ data: [] });
+        const regex = new RegExp(escapeRegex(needle), 'i');
+
+        const docs = await Data.find(filter).populate('userId', 'username dealerId').lean();
+        const rows = [];
+
+        for (const doc of (docs || [])) {
+            const owner = doc.userId || {};
+            for (const item of (doc.data || [])) {
+                const no = String(item.uniqueId || '');
+                if (!regex.test(no)) continue;
+                rows.push({
+                    parentId: doc._id,
+                    objectId: item._id,
+                    no,
+                    f: Number(item.firstPrice) || 0,
+                    s: Number(item.secondPrice) || 0,
+                    clientId: owner._id || null,
+                    clientName: owner.username || '',
+                    clientDealerId: owner.dealerId || '',
+                    date: doc.date,
+                    timeSlot: doc.timeSlot,
+                    timeSlotId: doc.timeSlotId || null,
+                });
+            }
+        }
+
+        return res.status(200).json({ data: rows });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+};
+
 export {
     addDataForTimeSlot,
     getDataForDate,
@@ -336,6 +399,7 @@ export {
     deleteWinningNumbers,
     deleteIndividualEntries,
     getDataForClient,
-    getCombinedVoucherData
+    getCombinedVoucherData,
+    searchDataByNumber
 }
 

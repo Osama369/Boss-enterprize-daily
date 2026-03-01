@@ -39,6 +39,7 @@ const userSchema = new mongoose.Schema({
   isActive : {
     type: Boolean, 
     default: true
+    
   }, 
   // Add 'party' role so distributor-created party accounts can be recognized
   role: { type: String, enum: ['admin', 'user', 'distributor', 'party'], default: 'user' }, 
