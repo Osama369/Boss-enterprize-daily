@@ -45,7 +45,7 @@ const addDataForTimeSlot = async (req, res) => {
         user.balance -= totalAmount;
         await user.save();
 
-        res.status(201).json({ message: 'Data added successfully', newData });
+        res.status(201).json({ message: 'Data added successfully', newData, newBalance: user.balance });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -104,7 +104,7 @@ const deleteDataObjectById = async (req , res) => {
         // Refund the amount to user's balance
         user.balance += refundAmount;
         await user.save();
-        return res.status(200).json({ message: "Data deleted successfully" });
+        return res.status(200).json({ message: "Data deleted successfully", newBalance: user.balance });
     } catch (error) {
         return res.status(400).json({ error: error.message });
     }
@@ -356,7 +356,7 @@ const searchDataByNumber = async (req, res) => {
 
         const needle = String(q || '').trim();
         if (!needle) return res.status(200).json({ data: [] });
-        const regex = new RegExp(escapeRegex(needle), 'i');
+        const regex = new RegExp(`^${escapeRegex(needle)}$`);
 
         const docs = await Data.find(filter).populate('userId', 'username dealerId').lean();
         const rows = [];
