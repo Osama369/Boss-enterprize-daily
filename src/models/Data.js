@@ -44,4 +44,7 @@ const dataSchema = new mongoose.Schema({
     timestamps: true,
 });
 
+dataSchema.index({ userId: 1, date: 1, timeSlotId: 1 });
+dataSchema.index({ userId: 1, "data._id": 1 });
+
 export default mongoose.model("Data", dataSchema);

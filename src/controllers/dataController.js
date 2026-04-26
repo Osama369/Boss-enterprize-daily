@@ -18,6 +18,18 @@ function escapeRegex(input = '') {
     return String(input).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+const voucherReadSelect = "userId date timeSlot timeSlotId data createdAt updatedAt";
+
+function isTransactionUnsupportedError(error) {
+    const message = String(error?.message || "").toLowerCase();
+    return (
+        message.includes("transaction numbers are only allowed") ||
+        message.includes("replica set") ||
+        message.includes("mongos") ||
+        message.includes("transactions are not supported")
+    );
+}
+
 const addDataForTimeSlot = async (req, res) => {
     const { data, userId: targetUserIdBody, date, timeSlot, timeSlotId } = req.body;
     if (!Array.isArray(data) || data.length === 0) return res.status(400).json({ error: 'data array is required' });
@@ -33,19 +45,70 @@ const addDataForTimeSlot = async (req, res) => {
 
         const totalAmount = data.reduce((sum, item) => sum + (Number(item.firstPrice) || 0) + (Number(item.secondPrice) || 0), 0);
         const effectiveUserId = targetUserIdBody || req.query.userId || req.user.id;
-        const user = await User.findById(effectiveUserId);
-        if (!user) return res.status(404).json({ error: 'User not found' });
-        if (user.balance < totalAmount) return res.status(400).json({ error: 'Insufficient balance', currentBalance: user.balance, requiredAmount: totalAmount });
+        const userExists = await User.exists({ _id: effectiveUserId });
+        if (!userExists) return res.status(404).json({ error: 'User not found' });
 
         const payload = { userId: effectiveUserId, data, date: d, timeSlot: slotDoc.label, timeSlotId: slotDoc._id };
+        let debitedUser = null;
+        let createdRecord = null;
 
-        const newData = new Data(payload);
-        await newData.save();
+        try {
+            const session = await Data.startSession();
+            try {
+                session.startTransaction();
 
-        user.balance -= totalAmount;
-        await user.save();
+                debitedUser = await User.findOneAndUpdate(
+                    { _id: effectiveUserId, balance: { $gte: totalAmount } },
+                    { $inc: { balance: -totalAmount } },
+                    { new: true, session }
+                );
 
-        res.status(201).json({ message: 'Data added successfully', newData, newBalance: user.balance });
+                if (!debitedUser) {
+                    await session.abortTransaction();
+                    return res.status(400).json({ error: 'Insufficient balance', requiredAmount: totalAmount });
+                }
+
+                const createdDocs = await Data.create([payload], { session });
+                createdRecord = createdDocs[0]?.toObject ? createdDocs[0].toObject() : createdDocs[0];
+                await session.commitTransaction();
+            } catch (error) {
+                if (session.inTransaction()) {
+                    await session.abortTransaction();
+                }
+
+                if (!isTransactionUnsupportedError(error)) {
+                    throw error;
+                }
+            } finally {
+                await session.endSession();
+            }
+        } catch (transactionError) {
+            if (!isTransactionUnsupportedError(transactionError)) {
+                throw transactionError;
+            }
+        }
+
+        if (!createdRecord) {
+            debitedUser = await User.findOneAndUpdate(
+                { _id: effectiveUserId, balance: { $gte: totalAmount } },
+                { $inc: { balance: -totalAmount } },
+                { new: true }
+            );
+
+            if (!debitedUser) {
+                return res.status(400).json({ error: 'Insufficient balance', requiredAmount: totalAmount });
+            }
+
+            try {
+                const createdDoc = await Data.create(payload);
+                createdRecord = createdDoc?.toObject ? createdDoc.toObject() : createdDoc;
+            } catch (createError) {
+                await User.findByIdAndUpdate(effectiveUserId, { $inc: { balance: totalAmount } });
+                throw createError;
+            }
+        }
+
+        res.status(201).json({ message: 'Data added successfully', newData: createdRecord, newBalance: debitedUser.balance });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -64,7 +127,10 @@ const getDataForDate = async (req, res) => {
         }
         const filterBase = buildDateSlotFilter({ date, timeSlot, timeSlotId });
         filterBase.userId = req.user.id;
-        const data = await Data.find(filterBase);
+        const data = await Data.find(filterBase)
+            .select(voucherReadSelect)
+            .sort({ createdAt: 1, _id: 1 })
+            .lean();
         if (!data || data.length === 0) return res.status(404).json({ error: 'No data found for the given date/timeSlot' });
         res.status(200).json({ data });
     } catch (err) {
@@ -181,7 +247,7 @@ const deleteIndividualEntries = async (req, res) => {
 
 const getAllDocuments = async (req , res) => {
     try {
-        const data = await Data.find();
+        const data = await Data.find().select(voucherReadSelect).lean();
         if(!data){
             return res.status(404).json({ error: "No data available" });
         }
@@ -285,7 +351,10 @@ const getDataForClient = async (req, res) => {
         }
         const filterBase = buildDateSlotFilter({ date, timeSlot, timeSlotId });
         filterBase.userId = userId;
-        const data = await Data.find(filterBase);
+        const data = await Data.find(filterBase)
+            .select(voucherReadSelect)
+            .sort({ createdAt: 1, _id: 1 })
+            .lean();
         if (!data || data.length === 0) return res.status(404).json({ error: 'No data found for the given date and user' });
         res.status(200).json({ data });
     } catch (error) {
@@ -321,7 +390,11 @@ const getCombinedVoucherData = async (req, res) => {
         }
 
         // Populate user info so frontend can show dealer names
-        const data = await Data.find(filter).populate('userId', 'username dealerId');
+        const data = await Data.find(filter)
+            .select(voucherReadSelect)
+            .populate({ path: 'userId', select: 'username dealerId', options: { lean: true } })
+            .sort({ createdAt: 1, _id: 1 })
+            .lean();
         if (!data || data.length === 0) return res.status(404).json({ error: 'No data found for the given filter' });
         res.status(200).json({ data });
     } catch (error) {
@@ -358,7 +431,10 @@ const searchDataByNumber = async (req, res) => {
         if (!needle) return res.status(200).json({ data: [] });
         const regex = new RegExp(`^${escapeRegex(needle)}$`);
 
-        const docs = await Data.find(filter).populate('userId', 'username dealerId').lean();
+        const docs = await Data.find(filter)
+            .select('userId date timeSlot timeSlotId data')
+            .populate({ path: 'userId', select: 'username dealerId', options: { lean: true } })
+            .lean();
         const rows = [];
 
         for (const doc of (docs || [])) {
